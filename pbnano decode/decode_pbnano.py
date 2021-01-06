@@ -14,8 +14,6 @@ import json
 import pprint
 import argparse
 
-BASE_ADDRESS = 0x3F420110
-
 PB_LTYPE_MASK = 0x0F
 
 type_attribs = {
@@ -62,6 +60,12 @@ requirements = {
 "PB_HTYPE_REPEATED"  :0x20,
 "PB_HTYPE_ONEOF"     :0x30}
 
+wire_types = {
+"PB_WT_VARINT" : 0,
+"PB_WT_64BIT"  : 1,
+"PB_WT_STRING" : 2,
+"PB_WT_32BIT"  : 5}
+
 def auto_int(x):
     return int(x, 0)
 
@@ -89,21 +93,19 @@ class field:
                 eof = False
         
         if eof:
-            #print("end of pbnano fields")
             self.eof = True
             return
         else:
-            #(self.tag,self.typ,self.data_offset,self.size_offset,self.data_size,self.array_size,self.ptr) = unpack(">IBIIIII", buf)
-            #print(binascii.hexlify(buf))
             (self.tag,self.typ,self.data_offset,self.size_offset,self.data_size,self.array_size,self.ptr) = unpack("<IBIIIII", buf)
             
             self.data_offset = toSigned32(self.data_offset)
             self.size_offset = toSigned32(self.size_offset)
             self.data_size = toSigned32(self.data_size)
             self.array_size = toSigned32(self.array_size)
+            self.subfields = []
             
             if(self.ptr != 0):
-                self.offset = self.ptr - BASE_ADDRESS
+                self.offset = self.ptr - memory_base
             else:            
                 self.offset = None
             
@@ -112,6 +114,9 @@ class field:
                 self.submsg = True
                 
             self.eof = False
+
+    def add_submessage(self, f):
+        self.subfields.append( f )
             
     def create_json(self):
         s = self.decode_type()
@@ -122,8 +127,7 @@ class field:
                     "size_offset":self.size_offset,
                     "data_size":self.data_size,
                     "array_size":self.array_size,
-                    "submessage" : "None"}
-        #return(json.dumps(jobject))                        
+                    "submessage" : "None"}                  
         return(jobject)                        
                     
             
@@ -163,25 +167,25 @@ def expand_subfield(fbin, fields, jobject):
             #print("ending")
             return
         else:
-            print("\ntype: %x" % f.typ)
-            print("Tag: %x" % f.tag)
+            print("\nTag: %x" % f.tag)
+            print("Type: %x" % f.typ)
             print("data_offset: %x" % f.data_offset)
             print("size_offset: %d" % f.size_offset)
             print("data_size: %x" % f.data_size)
             print("array_size: %x" % f.array_size)
             
             if f.offset:
+                #print("ptr: %x" % f.ptr)
                 print("offset: %x" % f.offset)
                 
             print("Attributes: %s" % f.decode_type())
             
-            fields.append(field)
-            
             #json
             parent = f.create_json()
             
+            # check for subfields
             if(f.submsg):
-                print("recursive expand_subfield")
+                print("expand_subfield")
                 
                 # stream pointer
                 last_loc = fbin.tell()
@@ -189,22 +193,108 @@ def expand_subfield(fbin, fields, jobject):
                 check = fbin.tell()
                                                 
                 if(check == f.offset):
-                    print("trying %x %x" % (f.offset, check))
                     children = []
+                    fchildern = []
                     expand_subfield(fbin, fields, children)
                     
                     if children:
                         parent["submessage"] = children
+                        
+                    if fchildern:
+                        f.add_submessage(fchildern)                        
                                         
                     fbin.seek(last_loc)
+                    
                 else:
                     print("seek set failed tried %x" % f.offset)   
+            
+            #fields.append(field)
+            fields.append(f)
             
             jobject.append(parent)                                                     
 
 ####
 
+def load_tag(tag, fields):
+    for f in fields:
+        print(f.tag)
+
+    return f        
+
+#def pb_decode_varint32_eof(fbin, fields):
+def pb_decode_varint32_eof(value):
+    #decode stream
+    result = 0
+    #b = fbin.read(1)
+    b = next(value)
+    print("pb_decode_varint32_eof %x" % b)
+    
+    if (b & 0x80 == 0):
+        # Quick case, 1 byte value
+        result = b;
+    else:
+        # Multibyte case 
+        bitpos = 7;
+        result = b & 0x7F;
+        
+        while True:
+            #b = fbin.read(1)
+            b = next(value)
+            
+            if not b:
+                return None
+            
+            if (bitpos >= 32):
+                # Note: The varint could have trailing 0x80 bytes, or 0xFF for negative. 
+                if (bitpos < 63):
+                    sign_extension = 0xFF
+                else: 
+                    sign_extension = 0x01                           
+                
+                if ( (b & 0x7F) != 0x00 and ((result >> 31) == 0 or b != sign_extension) ):
+                    print("varint overflow");
+                    return None
+            else:
+                result |= (b & 0x7F) << bitpos;
+                print("result bitpos%d : %x" % (bitpos, result))
+                
+            bitpos = bitpos + 7;
+            
+            if (b & 0x80 == 0):
+                break
+        
+        if (bitpos == 35 and (b & 0x70) != 0):
+            # The last byte was at bitpos=28, so only bottom 4 bits fit. 
+            print("varint overflow");
+            
+    return result            
+
+def pb_decode_varint(value):
+    bitpos =0
+    result = 0
+    
+    while True:
+        if (bitpos >= 64):
+            print("varint overflow")
+        
+        b = next(value)
+        print("next %x" % b)
+
+        
+        if not b:
+            return None
+
+        result |= (b & 0x7F) << bitpos
+        bitpos = bitpos + 7
+        print("result bitpos%d : %x" % (bitpos, result))
+        
+        if (b & 0x80):
+            break
+    
+    return result;
+
 def main():
+    global memory_base 
     parser = argparse.ArgumentParser(description='Parses a PBNano file for the various message structures and writes it to a json file')
 
     parser.add_argument("--file", "-f", type=str, required=True, help="File which contains the pbnano compiled structure")
@@ -216,10 +306,11 @@ def main():
     if not args.base:
         args.base = 0x3F420110
 
-    BASE_ADDRESS = args.base
+    memory_base = args.base
+    print(hex(memory_base))
     
     fsize = os.path.getsize(filename)
-    print("unpacking %s dize %x" %(filename, fsize))
+    print("Unpacking %s size %x" %(filename, fsize))
 
     with open(filename,'rb') as fbin:
         fields = []
@@ -227,14 +318,54 @@ def main():
         
         expand_subfield(fbin, fields, jobject)    
         
-        """
-        j = json.dumps(jobject)
-        pp = pprint.PrettyPrinter(indent=4)
-        pp.pprint(j)
-        """
-        
         with open('data.json', 'w', encoding='utf-8') as f:
-            json.dump(jobject, f, ensure_ascii=False, indent=4)
+            json.dump(jobject, f, ensure_ascii=False, indent=4)       
+
+
+    # First Tag = 0xA
+    # First wire type 0x6 =
+    #inp = [0x0A, 0x06] 
+    inp = [0x12, 0x19] 
+    out = inp[0]
+    #out=pb_decode_varint32_eof(iter(inp))
+    tag = out >> 3;
+    wire_type = out & 7;
+    sinp = str(inp)
+    print("in: %s out: %x tag:%x wire_type:%x" % (sinp, out, tag, wire_type))
+
+"""
+    # Tag 10, Wire type PB_LTYPE_SVARINT
+    inp = [0x82, 0x1] 
+    out=pb_decode_varint32_eof(iter(inp))
+    tag = out >> 3;
+    wire_type = out & 7;
+    sinp = str(inp)
+    print("in: %s out: %x tag:%x wire_type:%x" % (sinp, out, tag, wire_type))
+    
+    # Tag 4, Wire type PB_LTYPE_VARINT
+    inp = [0x21, 0x08] 
+    out = pb_decode_varint32_eof(iter(inp))
+    tag = out >> 3;
+    wire_type = out & 7;
+    sinp = str(inp)
+    print("in: %s out: %x tag:%x wire_type:%x" % (sinp, out, tag, wire_type))
+    
+    # Tag 0, Wire type PB_LTYPE_STRING
+    inp = [0x06, 0x12]   
+    out = pb_decode_varint32_eof(iter(inp))
+    tag = out >> 3;
+    wire_type = out & 7;
+    sinp = str(inp)
+    print("in: %s out: %x tag:%x wire_type:%x" % (sinp, out, tag, wire_type))
+    
+    
+    inp = [0x0B, 0x57, 0x54, 0x32, 0x35, 0x47, 0x32, 0x2D, 0x30, 0x30, 0x30, 0x31] 
+    out = pb_decode_varint32_eof(iter(inp))
+    #out=pb_decode_varint(iter(inp))
+
+    sinp = str(inp)
+    print("in: %s out: %x" % (sinp, out))
+"""                    
 
 if __name__ == "__main__":
     main()
